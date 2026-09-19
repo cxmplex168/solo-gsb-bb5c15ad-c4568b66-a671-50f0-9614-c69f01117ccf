@@ -41,6 +41,15 @@ def _validate_code(value: str) -> str:
     return value
 
 
+def _validate_cancellation_code(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("cancellation_code 不能为空（一次性撤销码）")
+    if len(value) > _CODE_MAX:
+        raise ValueError(f"cancellation_code 长度不能超过 {_CODE_MAX}")
+    return value
+
+
 def _validate_token(value: str) -> str:
     value = value.strip()
     if not value:
@@ -188,6 +197,13 @@ class OfferCreateRequest(BaseModel):
     confirmation_code: str = Field(
         ..., description="一次性确认码，服务端只保存其 SHA-256 摘要"
     )
+    cancellation_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选一次性撤销码：持有人此后可凭其撤销邀约；服务端只保存"
+            "带 offer_id 域分隔的 SHA-256 摘要。缺省则邀约不可撤销"
+        ),
+    )
     witnesses: Optional[list[WitnessInput]] = Field(
         default=None,
         description=(
@@ -226,6 +242,13 @@ class OfferCreateRequest(BaseModel):
     @classmethod
     def _check_confirmation_code(cls, v: str) -> str:
         return _validate_code(v)
+
+    @field_validator("cancellation_code")
+    @classmethod
+    def _check_cancellation_code(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return _validate_cancellation_code(v)
 
     @model_validator(mode="after")
     def _check_witnesses(self) -> "OfferCreateRequest":
@@ -292,6 +315,17 @@ class OfferConfirmRequest(BaseModel):
         return _validate_code(v)
 
 
+class OfferCancelRequest(BaseModel):
+    cancellation_code: str = Field(
+        ..., description="发起邀约时设置的一次性撤销码"
+    )
+
+    @field_validator("cancellation_code")
+    @classmethod
+    def _check_cancellation_code(cls, v: str) -> str:
+        return _validate_cancellation_code(v)
+
+
 class WitnessStateOut(BaseModel):
     witness_index: int
     name: str
@@ -308,8 +342,8 @@ class OfferStatusOut(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "pending（待确认）/ accepted（已确认）/ expired（已过期，派生）/ "
-            "rejected（见证模式下有见证人拒绝，派生）/ "
+            "pending（待确认）/ accepted（已确认）/ cancelled（已撤销）/ "
+            "expired（已过期，派生）/ rejected（见证模式下有见证人拒绝，派生）/ "
             "terminated（链尾已推进，派生）"
         ),
     )
@@ -318,6 +352,9 @@ class OfferStatusOut(BaseModel):
     accepted_at: Optional[str] = None
     accepted_seq: Optional[int] = Field(
         None, description="确认后追加的移交事件序号；未确认时为 null"
+    )
+    cancelled_at: Optional[str] = Field(
+        None, description="撤销时间；未撤销时为 null"
     )
     witness_mode: bool = False
     witness_threshold: Optional[int] = Field(
@@ -343,7 +380,8 @@ class WitnessStatusOut(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "邀约派生状态：pending / accepted / expired / rejected / terminated"
+            "邀约派生状态：pending / accepted / cancelled / expired / "
+            "rejected / terminated"
         ),
     )
     witness_threshold: int = Field(..., description="通过所需同意数")

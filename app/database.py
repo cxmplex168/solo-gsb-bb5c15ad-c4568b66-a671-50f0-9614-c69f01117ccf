@@ -7,6 +7,9 @@
 - offers：待接收移交邀约。只保存一次性确认码的 SHA-256 摘要（code_digest），
   不保存明文；tail_hash 记录邀约发起时锁定的链尾，确认时必须仍然匹配。
   witness_threshold 为 NULL 表示无见证邀约（兼容存量数据），否则为通过阈值。
+  cancel_digest 为可选一次性撤销码的 SHA-256 摘要（与 offer_id 做域分隔），
+  NULL 表示该邀约不可撤销（含存量旧邀约）；cancelled_at 非 NULL 表示邀约
+  已被撤销（与 accepted 互斥的存储终态，由写事务串行保证）。
 - offer_witnesses：见证邀约的见证人。只保存一次性令牌的 SHA-256 摘要
   （token_digest，与 offer_id 做域分隔），不存明文；decision 为 NULL 表示
   尚未表态，同一见证人至多表态一次（令牌本身即一次性）。拒绝/过期/链尾推进
@@ -68,12 +71,14 @@ CREATE TABLE IF NOT EXISTS offers (
     tail_hash          TEXT NOT NULL,
     receiver           TEXT NOT NULL,
     code_digest        TEXT NOT NULL,
+    cancel_digest      TEXT,
     witness_threshold  INTEGER,
     status             TEXT NOT NULL DEFAULT 'pending',
     expires_at         TEXT NOT NULL,
     created_at         TEXT NOT NULL,
     accepted_at        TEXT,
     accepted_seq       INTEGER,
+    cancelled_at       TEXT,
     CHECK(status IN ('pending', 'accepted')),
     CHECK(witness_threshold IS NULL OR witness_threshold >= 1),
     FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
@@ -127,8 +132,9 @@ def _get_conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     """初始化（或校验）数据库结构。可重复执行。
 
-    对更早版本创建的 offers 表增量补列 witness_threshold；
-    存量无见证邀约该列为 NULL，行为与升级前完全一致。
+    对更早版本创建的 offers 表增量补列 witness_threshold / cancel_digest /
+    cancelled_at；存量邀约这些列均为 NULL：无见证邀约行为与升级前一致，
+    无撤销码邀约不可撤销。
     """
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
@@ -141,6 +147,10 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE offers ADD COLUMN witness_threshold INTEGER"
             )
+        if "cancel_digest" not in offer_cols:
+            conn.execute("ALTER TABLE offers ADD COLUMN cancel_digest TEXT")
+        if "cancelled_at" not in offer_cols:
+            conn.execute("ALTER TABLE offers ADD COLUMN cancelled_at TEXT")
 
 
 @contextmanager
