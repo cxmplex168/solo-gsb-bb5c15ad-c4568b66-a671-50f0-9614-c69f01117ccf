@@ -28,17 +28,31 @@
   1. **发起邀约** `POST /offers`：携带当前 `tail_hash`、指定的 `receiver`、
      有效期 `expires_in_seconds`（秒，上限 7 天）与一次性确认码
      `confirmation_code`。服务端**只保存确认码的 SHA-256 摘要**（明文不落库），
-     返回 `offer_id`；链尾不匹配返回 **409**。
+     返回 `offer_id`；链尾不匹配返回 **409**。还可**可选**提交一次性撤销码
+     `cancellation_code`：服务端仅保存「绑定 `offer_id` 做域分隔」的
+     **SHA-256 撤销码摘要**；省略撤销码则创建**不可撤销**的邀约
+     （与历史版本完全兼容）。
   2. **确认邀约** `POST /offers/{offer_id}/confirm`：接收方凭 `offer_id` 与
      确认码确认。服务端在**同一个 SQLite 立即事务**中依次校验「确认码摘要匹配 →
-     邀约未过期 → 邀约未使用 → 链尾仍匹配」，全部通过后追加唯一移交事件
-     （`nonce` 取 `offer:<offer_id>`，天然一次性）并将邀约置为 `accepted`，
-     整体原子提交。**过期（`offer_expired`）、重复确认（`offer_already_accepted`）、
-     链尾已推进（`tail_mismatch`）均返回 409 且不写任何事件**；
+     邀约未过期 → 邀约未使用 → 邀约未撤销 → 链尾仍匹配」，全部通过后追加唯一
+     移交事件（`nonce` 取 `offer:<offer_id>`，天然一次性）并将邀约置为
+     `accepted`，整体原子提交。**过期（`offer_expired`）、重复确认
+     （`offer_already_accepted`）、链尾已推进（`tail_mismatch`）、邀约已撤销
+     （`offer_not_cancellable`）均返回 409 且不写任何事件**；
      确认码错误返回 **403**（`code_mismatch`）。
-  3. **查询邀约** `GET /offers/{offer_id}`：返回邀约状态
-     （`pending` / `accepted` / `expired` / `terminated`，后两者为派生状态）
-     与确认结果，不含确认码及其摘要。
+  3. **撤销邀约** `POST /offers/{offer_id}/cancel`（仅创建时提供了
+     `cancellation_code` 的邀约可用）：发起方凭撤销码撤销。撤销、接收方确认与
+     见证人表态在**同一个 SQLite 立即事务层面互斥**，竞争终态中至多一个成功。
+     仅当邀约**仍 `pending` 且链尾未推进、未过期、无见证人拒绝**时可撤销，
+     撤销只把邀约置为 `cancelled`，**绝不追加或修改任何哈希链事件**；撤销码
+     错误返回 **403**（`cancel_code_mismatch`）。
+  4. **不可撤销的情形**：邀约已 `accepted`、`rejected`、`expired`、
+     `terminated`、`cancelled`，或创建时未提供撤销码（含全部旧邀约），
+     调用撤销一律返回 **409**（`offer_not_cancellable`）且不改写链。
+  5. **查询邀约** `GET /offers/{offer_id}`：返回邀约状态
+     （`pending` / `accepted` / `expired` / `terminated` / `rejected` /
+     `cancelled`，其中过期、终止、拒绝为派生状态）、`cancellable` 标记、
+     `cancelled_at` 与确认结果，**不含确认码、撤销码及其摘要**。
 - **见证确认（可选模式）**：发起邀约时可附带 2～5 名见证人及通过阈值
   `witness_threshold`（1～见证人数量），其余流程与普通邀约一致：
   1. 发起邀约时每个见证人提交 `name` 与一个**互相独立的一次性令牌** `token`。
@@ -53,8 +67,9 @@
      （`offer_rejected`），同意数不足返回 **409**
      （`witness_threshold_not_met`），均**不写任何事件**。
   4. **任一拒绝**即令邀约进入 `rejected` 终止态；**过期**、**链尾被其他移交
-     推进**（状态派生为 `terminated`）同样终止，终止后表态与确认均返回 409
-     且不写事件。
+     推进**（状态派生为 `terminated`）、**被撤销码撤销**（`cancelled`）同样
+     终止，终止后表态、确认与再次撤销均返回 409 且不写事件。撤销与表态/确认
+     在 SQLite 立即事务中互斥，竞争中只有一个终态能成功。
   5. **见证状态查询** `GET /offers/{offer_id}/witnesses`：返回各见证人的名称、
      序号、表态结果与同意/拒绝/待表态计数及派生邀约状态，**绝不返回令牌及其
      摘要**（`GET /offers/{offer_id}` 的邀约详情同样只给统计与表态结果）。
@@ -101,11 +116,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
-| `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选 2～5 名见证人与阈值） |
+| `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
+| `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
 | `POST` | `/offers/{offer_id}/witness-decisions` | 见证人凭独立一次性令牌表态同意 / 拒绝（每人至多一次） |
 | `GET`  | `/offers/{offer_id}/witnesses` | 查询见证表态状态与计数（不含令牌摘要；无见证邀约 404） |
-| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired / rejected / terminated） |
+| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired / rejected / terminated / cancelled） |
 | `GET`  | `/chains` | 列出全部链条 |
 | `GET`  | `/chains/{chain_id}` | 查询链条与全部事件 |
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
@@ -118,8 +134,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `offer_rejected`（已有见证人拒绝，邀约终止）、
 `witness_threshold_not_met`（同意数未达阈值）、
 `witness_already_decided`（见证人已表态，令牌不可重复使用）、
-`offer_not_witnessed`（对无见证邀约调用表态接口）；
-**403** —— `code_mismatch`（确认码错误）、`token_mismatch`（见证人令牌错误）；
+`offer_not_witnessed`（对无见证邀约调用表态接口）、
+`offer_not_cancellable`（邀约不可撤销：已 accepted / rejected / expired /
+terminated / cancelled，或创建时未提供撤销码的旧邀约；撤销与确认/表态竞争
+落败也返回此码）；
+**403** —— `code_mismatch`（确认码错误）、`token_mismatch`（见证人令牌错误）、
+`cancel_code_mismatch`（撤销码错误）；
 **404** —— 链条、邀约不存在，或对无见证邀约查询 `witness_mode_not_found`。
 
 ## 使用示例
@@ -178,8 +198,47 @@ curl -s -X POST http://localhost:8000/offers/7c4e.../confirm \
 #    过期 → 409 offer_expired；期间链尾被其他移交推进 → 409 tail_mismatch；
 #    以上均不写任何事件
 
-# 4) 查询邀约状态（pending / accepted / expired / rejected / terminated）
+# 4) 查询邀约状态（pending / accepted / expired / rejected / terminated / cancelled）
 curl -s http://localhost:8000/offers/7c4e...
+```
+
+### 撤销邀约示例
+
+```bash
+# 1) alice 发起「可撤销」邀约：额外提供 cancellation_code（省略则不可撤销）
+curl -s -X POST http://localhost:8000/offers \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob",
+       "expires_in_seconds":3600,"confirmation_code":"s3cret",
+       "cancellation_code":"v0uch-99"}'
+# 响应：{"offer_id":"5b8d...","status":"pending","cancellable":true, ...}
+# 服务端只保存绑定 offer_id 做域分隔的撤销码 SHA-256 摘要，明文不落库
+
+# 2) bob 确认之前，alice 凭撤销码撤销（不追加任何链上事件）
+curl -s -X POST http://localhost:8000/offers/5b8d.../cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"cancellation_code":"v0uch-99"}'
+# {"offer_id":"5b8d...","status":"cancelled","cancellable":true,
+#  "cancelled_at":"2026-...","tail_hash":"<邀约锁定的链尾，仍是当前链尾>"}
+
+# 3) 撤销码错误 → 403 cancel_code_mismatch
+curl -i -X POST http://localhost:8000/offers/5b8d.../cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"cancellation_code":"wrong"}'
+
+# 4) 已撤销后再撤销 / 接收方再确认 / 见证人再表态
+#    → 409 offer_not_cancellable（不写事件，链尾不变）
+curl -i -X POST http://localhost:8000/offers/5b8d.../confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirmation_code":"s3cret"}'
+
+# 5) 旧邀约（创建时省略 cancellation_code，cancellable=false）撤销
+#    → 409 offer_not_cancellable；邀约过期、有见证人拒绝或链尾被推进后
+#      撤销同样返回 409 offer_not_cancellable
+
+# 6) 详情与见证查询返回 cancelled 状态，但不返回撤销码摘要
+curl -s http://localhost:8000/offers/5b8d...
+# {"status":"cancelled","cancellable":true,"cancelled_at":"...", ...}
 ```
 
 ### 见证确认示例
@@ -251,19 +310,27 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 
 1. 每次追加都在 `BEGIN IMMEDIATE` 事务内完成，且进程内写操作由互斥锁串行化；
    「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。邀约确认同样如此：
-   「验码 → 未过期 → 未使用 → 链尾匹配 → （见证模式）无拒绝且同意数达阈值
-   → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体回滚。
+   「验码 → 未过期 → 未使用 → 未撤销 → 链尾匹配 → （见证模式）无拒绝且同意数
+   达阈值 → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体
+   回滚。**邀约撤销、接收方确认与见证人表态共用同一把写锁与同一立即事务语义，
+   三者互斥**：撤销的「验撤销码 → 仍 pending → 未过期 → 链尾未推进 → 无拒绝 →
+   置 cancelled（且不追加任何链上事件）」整体原子，竞争终态（accepted /
+   cancelled / rejected）中最多一个成功，撤销成功后哈希链完全不变。
    见证人表态的「按令牌摘要定位见证人 → 查未表态 → 写入 decision」也在同一
    立即事务内串行完成，同一令牌并发表态最多一次成功。
 2. 数据库层设有 `UNIQUE(chain_id, seq)` 与 `UNIQUE(chain_id, nonce)` 唯一约束
    作为兜底，任何竞争写入都无法产生重号事件或重放随机数；邀约确认使用
-   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。见证人表设有
-   `UNIQUE(offer_id, witness_index)` 与 `UNIQUE(offer_id, token_digest)`，
-   且表态以「行已存在 decision」判定一次性，重复使用令牌不可能产生第二条表态。
+   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。撤销则以
+   `UPDATE ... WHERE status='pending'` 的影响行数兜底，竞争落败即回滚返回 409。
+   见证人表设有 `UNIQUE(offer_id, witness_index)` 与
+   `UNIQUE(offer_id, token_digest)`，且表态以「行已存在 decision」判定一次性，
+   重复使用令牌不可能产生第二条表态。
 3. WAL 日志模式 + busy timeout，兼顾读写并发与单写入者语义。
 4. 数据库初始化（`init_db`）全部使用 `CREATE ... IF NOT EXISTS`，可重复执行；
-   对已有数据文件只做增量补表（含 `offers`、`offer_witnesses` 表）与补列
-   （为旧版 `offers` 增补 `witness_threshold` 列），存量数据不受影响。
+   对已有数据文件只做增量补表（含 `offers`、`offer_witnesses` 表）；对旧版
+   `offers` 表按 SQLite 官方「建新表 → 搬数据 → 改名」流程一次性就地重建，
+   增补 `witness_threshold`（旧无见证邀约为 NULL）与 `cancel_code_digest` /
+   `cancelled_at`（旧邀约撤销码为 NULL，即不可撤销），存量邀约与事件不受影响。
 
 ## 项目结构
 
@@ -271,8 +338,8 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 查询 / 校验）
-│   ├── database.py    # SQLite 连接、建表（chains / events / offers / offer_witnesses）与串行写事务
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 见证 / 查询 / 校验）
+│   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型
 │   └── config.py      # 路径与端口配置

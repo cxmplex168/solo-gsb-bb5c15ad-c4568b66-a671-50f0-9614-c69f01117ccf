@@ -16,11 +16,24 @@
 
 待接收移交（邀约）流程
 ----------------------
-1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码），
-   服务端只保存确认码摘要并返回 offer_id；
+1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码，
+   可选一次性撤销码），服务端只保存确认码/撤销码摘要并返回 offer_id；
 2. 接收方凭 offer_id + 确认码确认：在同一 SQLite 立即事务中校验邀约
    未过期、未使用且链尾仍匹配，然后追加唯一移交事件并将邀约置为 accepted；
-3. 过期、重复确认或链尾已推进均返回 409 且不写事件。
+3. 发起方也可凭 offer_id + 撤销码撤销（POST /offers/{offer_id}/cancel）：
+   在同一 SQLite 立即事务中校验邀约仍 pending、未过期、无拒绝、链尾未推进，
+   然后将邀约置为 cancelled，不追加任何链上事件。撤销与接收方确认、见证人
+   表态互斥，竞争中最多只有一个终态成功；
+4. 过期、重复确认、链尾已推进或已撤销均返回 409 且不写事件。
+
+撤销码规则
+----------
+- 创建邀约时 cancellation_code 可选：省略则邀约不可撤销（与旧邀约一致）；
+- 服务端只保存「offer:<offer_id>:cancel-code:<code>」的 SHA-256 摘要，
+  摘要域绑定 offer_id 且与确认码、见证令牌分属不同域，明文绝不落库；
+- 凭码撤销：撤销码错误返回 403 cancel_code_mismatch；邀约已 accepted、
+  rejected（派生）、expired（派生）、terminated（派生）、cancelled 或
+  根本没有撤销码时返回 409 offer_not_cancellable，且不改写哈希链。
 
 见证确认模式（可选）
 --------------------
@@ -82,6 +95,16 @@ def _witness_token_digest(offer_id: str, token: str) -> str:
     且与确认码摘要分属不同域。绝不落库明文。
     """
     return digest_hex(f"offer:{offer_id}:witness-token:{token}")
+
+
+def _cancel_code_digest(offer_id: str, code: str) -> str:
+    """一次性撤销码的存储摘要。
+
+    摘要域绑定 offer_id（同一撤销码字符串在不同邀约间不可复用），且与
+    确认码摘要（offer-code:）、见证令牌摘要（:witness-token:）分属不同域。
+    绝不落库明文。
+    """
+    return digest_hex(f"offer:{offer_id}:cancel-code:{code}")
 
 
 def _genesis_payload(file_hash: str, holder: str) -> dict[str, Any]:
@@ -312,14 +335,18 @@ def _derived_offer_status(
 ) -> str:
     """邀约对外状态。
 
-    存储状态只有 pending / accepted；其余均为派生状态：
-    - rejected：见证模式下已有见证人拒绝（一旦拒绝不可恢复）；
+    存储状态为 pending / accepted / cancelled；其余均为派生状态：
+    - rejected：pending 且见证模式下已有见证人拒绝（一旦拒绝不可恢复）；
     - expired：pending 且当前时间已过有效期；
     - terminated：pending 且邀约锁定的链尾已被其他移交推进；
-    派生顺序为 accepted > rejected > expired > terminated > pending。
+    派生顺序为 accepted > cancelled > rejected > expired > terminated >
+    pending（accepted 与 cancelled 互斥，二者不会同时出现）。
     """
     if offer["status"] == "accepted":
         return "accepted"
+
+    if offer["status"] == "cancelled":
+        return "cancelled"
 
     for row in witness_rows:
         if row["decision"] == "rejected":
@@ -355,6 +382,8 @@ def _offer_to_dict(
         "created_at": offer["created_at"],
         "accepted_at": offer["accepted_at"],
         "accepted_seq": offer["accepted_seq"],
+        "cancellable": offer["cancel_code_digest"] is not None,
+        "cancelled_at": offer["cancelled_at"],
         "witness_mode": witness_mode,
         "witness_threshold": offer["witness_threshold"],
         "witness_count": len(witness_rows),
@@ -373,11 +402,17 @@ def create_offer(
     confirmation_code: str,
     witnesses: Optional[list[dict[str, str]]] = None,
     witness_threshold: Optional[int] = None,
+    cancellation_code: Optional[str] = None,
 ) -> dict[str, Any]:
     """发起待接收移交邀约。
 
     以当前链尾 tail_hash 锁定邀约：链尾不匹配（链条已推进）返回 409，
     邀约创建即无意义。确认码只保存 SHA-256 摘要，明文不落库。
+
+    cancellation_code 非空时邀约「可撤销」：保存绑定 offer_id 做域分隔的
+    SHA-256 摘要（offer:<offer_id>:cancel-code:<code>），此后可凭码调用
+    cancel_offer；省略时 cancel_code_digest 为 NULL，邀约不可撤销，行为与
+    旧版本完全一致。
 
     witnesses 非空时创建见证确认模式邀约（2～5 名见证人 + 通过阈值），
     每位见证人的独立一次性令牌同样只保存摘要；创建响应中一次性返回
@@ -404,11 +439,18 @@ def create_offer(
             timespec="seconds"
         )
 
+        cancel_digest = (
+            _cancel_code_digest(offer_id, cancellation_code)
+            if cancellation_code is not None
+            else None
+        )
+
         conn.execute(
             """INSERT INTO offers
                (offer_id, chain_id, tail_hash, receiver, code_digest,
-                witness_threshold, status, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                witness_threshold, status, expires_at, created_at,
+                cancel_code_digest, cancelled_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, NULL)""",
             (
                 offer_id,
                 chain_id,
@@ -418,6 +460,7 @@ def create_offer(
                 witness_threshold if witnesses else None,
                 expires_at,
                 created_at,
+                cancel_digest,
             ),
         )
 
@@ -451,6 +494,7 @@ def create_offer(
         "status": "pending",
         "expires_at": expires_at,
         "created_at": created_at,
+        "cancellable": cancellation_code is not None,
         "witness_mode": bool(witnesses),
         "witness_threshold": witness_threshold if witnesses else None,
         "witnesses": created_witnesses,
@@ -473,6 +517,11 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
         ).fetchone()
         if offer is None:
             raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        if offer["status"] == "cancelled":
+            raise ChainError(
+                409, "offer_not_cancellable", "邀约已撤销，不能确认，也不再可撤销"
+            )
 
         if offer["code_digest"] != _code_digest(confirmation_code):
             raise ChainError(403, "code_mismatch", "确认码不正确")
@@ -534,6 +583,102 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
     return result
 
 
+def cancel_offer(offer_id: str, cancellation_code: str) -> dict[str, Any]:
+    """发起方凭 offer_id + 撤销码撤销邀约，不追加任何链上事件。
+
+    所有校验与写入在同一个 SQLite 立即事务（BEGIN IMMEDIATE）中完成，与
+    接收方确认、见证人表态互斥：进程内由写锁串行，进程间由 SQLite 写锁
+    串行，竞争终态（accepted / cancelled / rejected …）中至多一个成功。
+
+    可撤销的充要条件：存储状态仍为 pending、未过期、无见证人拒绝、锁定的
+    链尾仍是当前链尾。任一不满足（含邀约已 accepted / rejected / expired /
+    terminated / cancelled，以及创建时未提供撤销码的旧邀约）返回 409
+    offer_not_cancellable 且不改写任何数据、不动哈希链；撤销码错误返回
+    403 cancel_code_mismatch。撤销码摘要本身从不出现在任何响应中。
+    """
+    with write_tx() as conn:
+        offer = conn.execute(
+            "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
+        ).fetchone()
+        if offer is None:
+            raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        # 终态 / 无撤销码：一律 409 offer_not_cancellable，不区分具体原因，
+        # 且在验码之前判定 —— 不具备撤销条件时不泄露撤销码是否匹配。
+        if offer["status"] != "pending":
+            if offer["status"] == "accepted":
+                message = "邀约已被接收方确认，不能撤销"
+            else:  # cancelled
+                message = "邀约已撤销，不能重复撤销"
+            raise ChainError(409, "offer_not_cancellable", message)
+
+        if _now_dt() > _parse_ts(offer["expires_at"]):
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "邀约已过期，不能撤销（过期为终止态）",
+            )
+
+        chain = conn.execute(
+            "SELECT tail_hash FROM chains WHERE chain_id = ?",
+            (offer["chain_id"],),
+        ).fetchone()
+        if chain is None:  # 外键约束下理论上不可达
+            raise ChainError(404, "not_found", f"链条不存在: {offer['chain_id']}")
+        if chain["tail_hash"] != offer["tail_hash"]:
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "链尾已推进：邀约所锁定的链尾不再是最新，不能撤销",
+            )
+
+        witness_rows = _load_witnesses(conn, offer_id)
+        if any(r["decision"] == "rejected" for r in witness_rows):
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "已有见证人拒绝，邀约已终止，不能撤销",
+            )
+
+        if offer["cancel_code_digest"] is None:
+            # 旧邀约 / 创建时省略 cancellation_code：兼容行为，不可撤销。
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "该邀约未设置撤销码，不能撤销",
+            )
+
+        if offer["cancel_code_digest"] != _cancel_code_digest(
+            offer_id, cancellation_code
+        ):
+            raise ChainError(403, "cancel_code_mismatch", "撤销码不正确")
+
+        cancelled_at = _now()
+        # WHERE 条件再兜底一次：本事务内竞态被写锁排除，影响行数不为 1
+        # 只可能意味着状态已被其他终态占据，此时绝不写入。
+        cursor = conn.execute(
+            """UPDATE offers
+               SET status = 'cancelled', cancelled_at = ?
+               WHERE offer_id = ? AND status = 'pending'""",
+            (cancelled_at, offer_id),
+        )
+        if cursor.rowcount != 1:
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "邀约已离开 pending 状态（竞争终止），撤销未生效",
+            )
+
+    return {
+        "offer_id": offer_id,
+        "chain_id": offer["chain_id"],
+        "status": "cancelled",
+        "cancellable": True,
+        "cancelled_at": cancelled_at,
+        "tail_hash": offer["tail_hash"],
+    }
+
+
 def record_witness_decision(
     offer_id: str, token: str, decision: str
 ) -> dict[str, Any]:
@@ -574,6 +719,13 @@ def record_witness_decision(
                 409,
                 "witness_already_decided",
                 f"见证人 {witness['name']} 已表态，令牌为一次性，不能重复使用",
+            )
+
+        if offer["status"] == "cancelled":
+            raise ChainError(
+                409,
+                "offer_not_cancellable",
+                "邀约已撤销，表态无效，也不再可撤销",
             )
 
         if offer["status"] != "pending":

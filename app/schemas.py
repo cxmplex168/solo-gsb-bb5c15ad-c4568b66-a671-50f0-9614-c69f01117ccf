@@ -15,7 +15,6 @@ _OFFER_TTL_MAX = 7 * 24 * 3600  # 邀约有效期上限：7 天
 _WITNESS_MIN = 2
 _WITNESS_MAX = 5
 
-
 def _validate_name(value: str, field: str) -> str:
     value = value.strip()
     if not value:
@@ -32,12 +31,12 @@ def _validate_hex64(value: str, field: str) -> str:
     return value
 
 
-def _validate_code(value: str) -> str:
+def _validate_code(value: str, field: str = "confirmation_code") -> str:
     value = value.strip()
     if not value:
-        raise ValueError("confirmation_code 不能为空（一次性确认码）")
+        raise ValueError(f"{field} 不能为空")
     if len(value) > _CODE_MAX:
-        raise ValueError(f"confirmation_code 长度不能超过 {_CODE_MAX}")
+        raise ValueError(f"{field} 长度不能超过 {_CODE_MAX}")
     return value
 
 
@@ -188,6 +187,14 @@ class OfferCreateRequest(BaseModel):
     confirmation_code: str = Field(
         ..., description="一次性确认码，服务端只保存其 SHA-256 摘要"
     )
+    cancellation_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "可选一次性撤销码：提供后邀约可凭此码调用取消接口撤销，"
+            "服务端只保存「绑定 offer_id 做域分隔」的 SHA-256 摘要；"
+            "省略则创建不可撤销的兼容旧行为邀约"
+        ),
+    )
     witnesses: Optional[list[WitnessInput]] = Field(
         default=None,
         description=(
@@ -226,6 +233,14 @@ class OfferCreateRequest(BaseModel):
     @classmethod
     def _check_confirmation_code(cls, v: str) -> str:
         return _validate_code(v)
+
+    @field_validator("cancellation_code")
+    @classmethod
+    def _check_cancellation_code(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        code = _validate_code(v, "cancellation_code")
+        return code or None
 
     @model_validator(mode="after")
     def _check_witnesses(self) -> "OfferCreateRequest":
@@ -267,9 +282,22 @@ class OfferOut(BaseModel):
     offer_id: str
     chain_id: str
     receiver: str
-    status: str = Field(..., description="邀约状态：pending / accepted / expired")
+    status: str = Field(
+        ...,
+        description=(
+            "邀约状态：pending / accepted / expired / rejected / "
+            "terminated / cancelled（后五者为终止或派生状态）"
+        ),
+    )
     expires_at: str
     created_at: str
+    cancellable: bool = Field(
+        default=False,
+        description=(
+            "是否可凭撤销码取消：仅创建时提供了 cancellation_code 的邀约为 true，"
+            "旧邀约恒为 false"
+        ),
+    )
     witness_mode: bool = Field(
         default=False,
         description="是否见证确认模式（无见证邀约恒为 false）",
@@ -292,6 +320,35 @@ class OfferConfirmRequest(BaseModel):
         return _validate_code(v)
 
 
+class OfferCancelRequest(BaseModel):
+    cancellation_code: str = Field(
+        ..., description="发起邀约时可选提供的一次性撤销码（服务端只存其摘要）"
+    )
+
+    @field_validator("cancellation_code")
+    @classmethod
+    def _check_cancellation_code(cls, v: str) -> str:
+        return _validate_code(v, "cancellation_code")
+
+
+class OfferCancelResult(BaseModel):
+    offer_id: str
+    chain_id: str
+    status: Literal["cancelled"] = Field(
+        "cancelled", description="撤销成功后邀约状态固定为 cancelled"
+    )
+    cancellable: bool = Field(
+        ..., description="固定为 true；不可撤销的邀约返回 409 而非本响应"
+    )
+    cancelled_at: str = Field(..., description="撤销时刻（UTC ISO-8601）")
+    tail_hash: str = Field(
+        ...,
+        description=(
+            "邀约锁定的链尾哈希；撤销不追加任何事件，它仍是当前链尾"
+        ),
+    )
+
+
 class WitnessStateOut(BaseModel):
     witness_index: int
     name: str
@@ -310,7 +367,7 @@ class OfferStatusOut(BaseModel):
         description=(
             "pending（待确认）/ accepted（已确认）/ expired（已过期，派生）/ "
             "rejected（见证模式下有见证人拒绝，派生）/ "
-            "terminated（链尾已推进，派生）"
+            "terminated（链尾已推进，派生）/ cancelled（已撤销，存储状态）"
         ),
     )
     expires_at: str
@@ -319,6 +376,14 @@ class OfferStatusOut(BaseModel):
     accepted_seq: Optional[int] = Field(
         None, description="确认后追加的移交事件序号；未确认时为 null"
     )
+    cancellable: bool = Field(
+        default=False,
+        description=(
+            "是否可凭撤销码取消；旧邀约（无撤销码）恒为 false，"
+            "响应不含撤销码及其摘要"
+        ),
+    )
+    cancelled_at: Optional[str] = Field(None, description="撤销时刻；未撤销为 null")
     witness_mode: bool = False
     witness_threshold: Optional[int] = Field(
         None, description="见证通过阈值；无见证邀约为 null"
@@ -343,7 +408,8 @@ class WitnessStatusOut(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "邀约派生状态：pending / accepted / expired / rejected / terminated"
+            "邀约派生状态：pending / accepted / expired / rejected / "
+            "terminated / cancelled"
         ),
     )
     witness_threshold: int = Field(..., description="通过所需同意数")
